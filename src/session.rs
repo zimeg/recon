@@ -1229,18 +1229,37 @@ fn discover_claude_tmux_panes() -> Vec<(i32, String, String, String)> {
     results
 }
 
-/// Check if a shell process has a claude child by looking for a child PID
-/// that has a corresponding ~/.claude/sessions/{PID}.json file.
+/// Walk descendants of `parent_pid` looking for one whose ~/.claude/sessions/{PID}.json
+/// exists. Necessary because wrapper scripts (e.g. `slack claude`, `cco`) sit between
+/// the shell and claude, so the shell's *direct* child is the wrapper, not claude.
+/// Bounded depth + a `seen` set guard against pathological trees.
 fn find_claude_child_pid(parent_pid: i32) -> Option<i32> {
+    use std::collections::{HashSet, VecDeque};
+    const MAX_DEPTH: usize = 6;
+
     let sessions_dir = dirs::home_dir()?.join(".claude").join("sessions");
-    let output = std::process::Command::new("pgrep")
-        .args(["-P", &parent_pid.to_string()])
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|l| l.trim().parse::<i32>().ok())
-        .find(|pid| sessions_dir.join(format!("{pid}.json")).exists())
+    let mut queue: VecDeque<(i32, usize)> = VecDeque::from([(parent_pid, 0)]);
+    let mut seen: HashSet<i32> = HashSet::new();
+
+    while let Some((pid, depth)) = queue.pop_front() {
+        if depth >= MAX_DEPTH || !seen.insert(pid) {
+            continue;
+        }
+        let output = std::process::Command::new("pgrep")
+            .args(["-P", &pid.to_string()])
+            .output()
+            .ok()?;
+        for child in String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse::<i32>().ok())
+        {
+            if sessions_dir.join(format!("{child}.json")).exists() {
+                return Some(child);
+            }
+            queue.push_back((child, depth + 1));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
