@@ -1186,46 +1186,27 @@ fn discover_claude_tmux_panes() -> Vec<(i32, String, String, String)> {
             Err(_) => continue,
         };
         let session_name = parts[1];
-        let command = parts[2];
+        // parts[2] is pane_current_command — deliberately unused (see below).
         let pane_path = parts[3];
         let window_index = parts[4];
         let pane_index = parts[5];
 
-        // Claude shows up as a version number (e.g. "2.1.76") or "claude" or "node".
-        // On macOS, the npm-distributed binary's internal process name is "claude.exe"
-        // (a bundler convention, not a Windows artifact), so tmux reports that instead.
-        // Nix/home-manager wraps the binary, so the foreground process is the wrapper
-        // ".claude-wrapped" that re-execs the real claude; match it too.
-        // If another binary name surfaces, consider switching to a `starts_with("claude")`
-        // match as a general case.
-        let is_claude = command
-            .chars()
-            .next()
-            .map(|c| c.is_ascii_digit())
-            .unwrap_or(false)
-            || command == "claude"
-            || command == "claude.exe"
-            || command == ".claude-wrapped"
-            || command == "node";
-
-        if is_claude {
-            // pane_pid is the initial process — it may be claude itself (recon launch)
-            // or a shell with claude as the foreground child (manual `claude` in a terminal).
-            // Try the pane PID first, fall back to searching children.
-            let claude_pid = if sessions_dir.join(format!("{pid}.json")).exists() {
-                Some(pid)
-            } else {
-                find_claude_child_pid(pid)
-            };
-            if let Some(cpid) = claude_pid {
-                let pane_target = format!("{session_name}:{window_index}.{pane_index}");
-                results.push((cpid, session_name.to_string(), pane_target, pane_path.to_string()));
-            }
-        } else if command == "bash" || command == "sh" || command == "zsh" {
-            if let Some(claude_pid) = find_claude_child_pid(pid) {
-                let pane_target = format!("{session_name}:{window_index}.{pane_index}");
-                results.push((claude_pid, session_name.to_string(), pane_target, pane_path.to_string()));
-            }
+        // Don't gate on `pane_current_command`. The foreground command tmux reports is
+        // unreliable for finding claude: it may be a version number (e.g. "2.1.76"),
+        // "claude", "claude.exe" (the npm bundler's internal name on macOS), "node", a
+        // login shell, or any wrapper that re-execs claude — ".claude-wrapped" (nix/
+        // home-manager) or ".xcrun-wrapped" (a nix devshell's xcrun shim sitting in front
+        // of a python launcher like `slack-claude`). Each new wrapper used to need another
+        // string added here. Instead, treat the pane pid as a root and look for any
+        // descendant (or the pane pid itself) that owns a ~/.claude/sessions/{PID}.json.
+        let claude_pid = if sessions_dir.join(format!("{pid}.json")).exists() {
+            Some(pid)
+        } else {
+            find_claude_child_pid(pid)
+        };
+        if let Some(cpid) = claude_pid {
+            let pane_target = format!("{session_name}:{window_index}.{pane_index}");
+            results.push((cpid, session_name.to_string(), pane_target, pane_path.to_string()));
         }
     }
 
@@ -1236,11 +1217,57 @@ fn discover_claude_tmux_panes() -> Vec<(i32, String, String, String)> {
 /// exists. Necessary because wrapper scripts (e.g. `slack claude`, `cco`) sit between
 /// the shell and claude, so the shell's *direct* child is the wrapper, not claude.
 /// Bounded depth + a `seen` set guard against pathological trees.
+///
+/// The child enumeration comes from a single `ps -axo pid=,ppid=` snapshot rather than
+/// per-node `pgrep -P`. On macOS `pgrep` matches against `KERN_PROCARGS2` and silently
+/// omits processes whose argv it can't read, so `pgrep -P <shell>` can return *nothing*
+/// even when `ps` plainly shows a claude child of that shell. Building the ppid->children
+/// map from `ps` once is both immune to that blind spot and cheaper than a pgrep per hop.
 fn find_claude_child_pid(parent_pid: i32) -> Option<i32> {
+    let sessions_dir = dirs::home_dir()?.join(".claude").join("sessions");
+    let children = process_children_map();
+    find_claude_descendant(parent_pid, &children, |pid| {
+        sessions_dir.join(format!("{pid}.json")).exists()
+    })
+}
+
+/// Build a `ppid -> [child pid]` map from a single `ps` snapshot of every process.
+fn process_children_map() -> std::collections::HashMap<i32, Vec<i32>> {
+    let output = match std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid="])
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return std::collections::HashMap::new(),
+    };
+    parse_process_children_map(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parse `ps -axo pid=,ppid=` output (each line: `<pid> <ppid>`) into a ppid->children map.
+fn parse_process_children_map(ps_output: &str) -> std::collections::HashMap<i32, Vec<i32>> {
+    let mut map: std::collections::HashMap<i32, Vec<i32>> = std::collections::HashMap::new();
+    for line in ps_output.lines() {
+        let mut fields = line.split_whitespace();
+        if let (Some(pid), Some(ppid)) = (fields.next(), fields.next()) {
+            if let (Ok(pid), Ok(ppid)) = (pid.parse::<i32>(), ppid.parse::<i32>()) {
+                map.entry(ppid).or_default().push(pid);
+            }
+        }
+    }
+    map
+}
+
+/// Bounded BFS over a precomputed ppid->children map, returning the first descendant
+/// of `parent_pid` for which `is_claude` holds. Native (`shell -> claude`) launches
+/// resolve at depth 1; wrapper chains (`shell -> wrapper -> claude`) resolve deeper.
+fn find_claude_descendant(
+    parent_pid: i32,
+    children: &std::collections::HashMap<i32, Vec<i32>>,
+    is_claude: impl Fn(i32) -> bool,
+) -> Option<i32> {
     use std::collections::{HashSet, VecDeque};
     const MAX_DEPTH: usize = 6;
 
-    let sessions_dir = dirs::home_dir()?.join(".claude").join("sessions");
     let mut queue: VecDeque<(i32, usize)> = VecDeque::from([(parent_pid, 0)]);
     let mut seen: HashSet<i32> = HashSet::new();
 
@@ -1248,15 +1275,8 @@ fn find_claude_child_pid(parent_pid: i32) -> Option<i32> {
         if depth >= MAX_DEPTH || !seen.insert(pid) {
             continue;
         }
-        let output = std::process::Command::new("pgrep")
-            .args(["-P", &pid.to_string()])
-            .output()
-            .ok()?;
-        for child in String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter_map(|l| l.trim().parse::<i32>().ok())
-        {
-            if sessions_dir.join(format!("{child}.json")).exists() {
+        for &child in children.get(&pid).into_iter().flatten() {
+            if is_claude(child) {
                 return Some(child);
             }
             queue.push_back((child, depth + 1));
@@ -1269,6 +1289,48 @@ fn find_claude_child_pid(parent_pid: i32) -> Option<i32> {
 mod tests {
     use super::*;
     use std::io::{BufReader, Cursor};
+
+    #[test]
+    fn parse_process_children_map_basic() {
+        // pid ppid pairs, mirroring `ps -axo pid=,ppid=` (whitespace-padded columns).
+        let out = "  35035       1\n  39592   35035\n  37807       1\n  37860   37807\n";
+        let map = parse_process_children_map(out);
+        assert_eq!(map.get(&35035), Some(&vec![39592]));
+        assert_eq!(map.get(&37807), Some(&vec![37860]));
+        assert_eq!(map.get(&1).map(|v| v.len()), Some(2));
+    }
+
+    #[test]
+    fn find_claude_descendant_native_launch() {
+        // shell 35035 -> claude 39592 (direct child). This is the case macOS `pgrep -P`
+        // could silently miss; building the map from `ps` resolves it at depth 1.
+        let map = parse_process_children_map("39592 35035\n");
+        let found = find_claude_descendant(35035, &map, |pid| pid == 39592);
+        assert_eq!(found, Some(39592));
+    }
+
+    #[test]
+    fn find_claude_descendant_wrapper_chain() {
+        // shell 38390 -> xcrun/python wrapper 38484 -> claude 38487.
+        let map = parse_process_children_map("38484 38390\n38487 38484\n");
+        let found = find_claude_descendant(38390, &map, |pid| pid == 38487);
+        assert_eq!(found, Some(38487));
+    }
+
+    #[test]
+    fn find_claude_descendant_none_when_absent() {
+        let map = parse_process_children_map("38484 38390\n");
+        let found = find_claude_descendant(38390, &map, |_| false);
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn find_claude_descendant_handles_cycles() {
+        // Pathological self/mutual parenting must not loop forever.
+        let map = parse_process_children_map("100 100\n200 100\n100 200\n");
+        let found = find_claude_descendant(100, &map, |pid| pid == 999);
+        assert_eq!(found, None);
+    }
 
     #[test]
     fn read_line_capped_normal() {
