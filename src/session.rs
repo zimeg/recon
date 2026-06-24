@@ -1194,6 +1194,8 @@ fn discover_claude_tmux_panes() -> Vec<(i32, String, String, String)> {
         // Claude shows up as a version number (e.g. "2.1.76") or "claude" or "node".
         // On macOS, the npm-distributed binary's internal process name is "claude.exe"
         // (a bundler convention, not a Windows artifact), so tmux reports that instead.
+        // Nix/home-manager wraps the binary, so the foreground process is the wrapper
+        // ".claude-wrapped" that re-execs the real claude; match it too.
         // If another binary name surfaces, consider switching to a `starts_with("claude")`
         // match as a general case.
         let is_claude = command
@@ -1203,6 +1205,7 @@ fn discover_claude_tmux_panes() -> Vec<(i32, String, String, String)> {
             .unwrap_or(false)
             || command == "claude"
             || command == "claude.exe"
+            || command == ".claude-wrapped"
             || command == "node";
 
         if is_claude {
